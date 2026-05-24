@@ -1,0 +1,4 @@
+interface:
+  display_name: "Multi GPT"
+  short_description: "Run PC-local parallel reasoning with multiple Codex stages."
+  default_prompt: "Use Multi GPT to compare several independent approaches and synthesize the best answer."

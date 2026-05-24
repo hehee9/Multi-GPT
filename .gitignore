@@ -1,0 +1,12 @@
+node_modules/
+npm-debug.log*
+
+# Multi GPT runtime state
+mcp_servers/multi-gpt/jobs/
+jobs/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
