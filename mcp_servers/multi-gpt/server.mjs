@@ -22,19 +22,20 @@ const CODEX_COMMAND = process.platform === 'win32' ? 'codex.cmd' : 'codex';
 const MAX_ERROR_TEXT = 4000;
 const JOBS_DIR = path.join(process.env.CODEX_HOME || path.join(homedir(), '.codex'), 'mcp_servers', 'multi-gpt', 'jobs');
 const JOBS = new Map();
+const JOB_CONTROLLERS = new Map();
 const MAX_RUNNING_JOBS = 5;
 const ACTIVE_CHILDREN = new Set();
 
 const TOOLS = [
   {
     name: 'multi_gpt_start',
-    description: 'Start a PC-local Multi GPT reasoning job and return immediately with a job_id. Runs usually take 5-20 minutes, commonly 10-15 minutes. Use this for all Multi GPT runs to avoid MCP tool-call timeouts; do not check status every minute.',
+    description: 'Start a local Multi GPT reasoning job and return immediately with a job_id. Runs usually take 5-20 minutes, commonly 10-15 minutes. Use this for all Multi GPT runs to avoid MCP tool-call timeouts; do not check status every minute.',
     inputSchema: {
       type: 'object',
       properties: {
         prompt: { type: 'string', description: 'Original user request.' },
         files: { type: 'array', items: { type: 'string' }, description: 'Optional local file paths to read and attach as context. Each file is read-only and size-limited.' },
-        model: { type: 'string', description: 'Optional Codex model name. Omit to use the Codex CLI default model.' },
+        model: { type: 'string', description: 'Optional Codex model name. Omit to let Codex CLI use its configured or recommended default model.' },
         reasoning_effort: { type: 'string', enum: ['none', 'low', 'medium', 'high', 'xhigh'], description: 'Reasoning effort. Omitted values are normalized to medium. Use none explicitly for non-reasoning mode.' },
         max_iterations: { type: 'number', description: 'Maximum Merger -> Refiner -> Judge loop iterations. Default 5.' },
       },
@@ -45,6 +46,18 @@ const TOOLS = [
   {
     name: 'multi_gpt_status',
     description: 'Check the status of a Multi GPT background job. Returns the final result once completed. Runs usually take 5-20 minutes, commonly 10-15 minutes, so poll only occasionally unless tighter monitoring is explicitly needed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        job_id: { type: 'string', description: 'Job id returned by multi_gpt_start.' },
+      },
+      required: ['job_id'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'multi_gpt_cancel',
+    description: 'Cancel a running Multi GPT background job started by this MCP server process. Terminates the active codex exec child process tree for that job and records status: canceled.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -73,6 +86,16 @@ async function writeJob(job) {
   }
 }
 
+async function writeJobIfNotCanceled(job, controller) {
+  throwIfCanceled(controller);
+  await writeJob(job);
+  if (controller?.canceled) {
+    const current = await readJob(job.job_id).catch(() => job);
+    await writeJob(canceledJob(current, controller.canceledAt));
+  }
+  throwIfCanceled(controller);
+}
+
 function runningJobCount() {
   let count = 0;
   for (const job of JOBS.values()) {
@@ -95,6 +118,7 @@ function publicJob(job) {
     status: job.status,
     created_at: job.created_at,
     updated_at: job.updated_at,
+    canceled_at: job.canceled_at || null,
     model: job.model,
     reasoning_effort: job.reasoning_effort,
     max_iterations: job.max_iterations,
@@ -102,6 +126,43 @@ function publicJob(job) {
     result: job.result || null,
     error: job.error || null,
   };
+}
+
+function createJobController(jobId) {
+  const controller = { jobId, children: new Set(), canceled: false, canceledAt: null };
+  JOB_CONTROLLERS.set(jobId, controller);
+  return controller;
+}
+
+function isCancelError(error) {
+  return error?.code === 'JOB_CANCELED';
+}
+
+function throwIfCanceled(controller) {
+  if (!controller?.canceled) return;
+  const error = new Error('job canceled');
+  error.code = 'JOB_CANCELED';
+  throw error;
+}
+
+function markControllerCanceled(controller, canceledAt = new Date().toISOString()) {
+  if (!controller) return canceledAt;
+  controller.canceled = true;
+  controller.canceledAt = controller.canceledAt || canceledAt;
+  return controller.canceledAt;
+}
+
+async function terminateJobChildren(controller) {
+  if (!controller) return;
+  const results = await Promise.all([...controller.children].map(terminateChildTreeAsync));
+  const failures = results.filter((result) => !result.ok);
+  if (failures.length) {
+    throw new Error(`failed to terminate ${failures.length} child process tree(s): ${failures.map((failure) => failure.error).join('; ')}`);
+  }
+}
+
+function canceledJob(job, canceledAt = new Date().toISOString()) {
+  return { ...job, status: 'canceled', canceled_at: job.canceled_at || canceledAt, result: null, error: null };
 }
 
 async function startMultiGptJob(args = {}) {
@@ -119,26 +180,64 @@ async function startMultiGptJob(args = {}) {
     result: null,
     error: null,
   };
+  const controller = createJobController(job.job_id);
   await writeJob(job);
-  runBackgroundJob(job.job_id, args).catch(() => {});
+  runBackgroundJob(job.job_id, args, controller).catch(() => {});
   return publicJob(job);
 }
 
-async function runBackgroundJob(jobId, args) {
+async function runBackgroundJob(jobId, args, controller) {
   let job = await readJob(jobId);
   try {
-    const result = await codexMar(args || {});
-    job = { ...job, status: result?.ok ? 'completed' : 'failed', result: result?.ok ? result : null, error: result?.ok ? null : result };
+    const result = await codexMar(args || {}, controller);
+    throwIfCanceled(controller);
+    const current = await readJob(jobId).catch(() => job);
+    if (current.status === 'canceled') return;
+    job = { ...current, status: result?.ok ? 'completed' : 'failed', result: result?.ok ? result : null, error: result?.ok ? null : result };
+    await writeJobIfNotCanceled(job, controller);
   } catch (error) {
-    job = { ...job, status: 'failed', result: null, error: { ok: false, error: String(error?.message || error) } };
+    const current = await readJob(jobId).catch(() => job);
+    if (current.status === 'canceled') return;
+    if (isCancelError(error) || controller?.canceled) {
+      job = canceledJob(current, controller?.canceledAt);
+      await writeJob(job);
+    } else {
+      job = { ...current, status: 'failed', result: null, error: { ok: false, error: String(error?.message || error) } };
+      await writeJobIfNotCanceled(job, controller);
+    }
+  } finally {
+    JOB_CONTROLLERS.delete(jobId);
   }
-  await writeJob(job);
 }
 
 async function getMultiGptJobStatus(args = {}) {
   const jobId = normalizeString(args.job_id);
   if (!jobId) throw new Error('job_id is required');
   return publicJob(await readJob(jobId));
+}
+
+async function cancelMultiGptJob(args = {}) {
+  const jobId = normalizeString(args.job_id);
+  if (!jobId) throw new Error('job_id is required');
+  const job = await readJob(jobId);
+  if (job.status !== 'running') return publicJob(job);
+
+  const controller = JOB_CONTROLLERS.get(jobId);
+  if (!controller) {
+    throw new Error(`job is running but is not owned by this MCP server process: ${jobId}`);
+  }
+
+  const canceledAt = markControllerCanceled(controller);
+  try {
+    await terminateJobChildren(controller);
+  } catch (error) {
+    controller.canceled = false;
+    controller.canceledAt = null;
+    throw error;
+  }
+  const canceled = canceledJob(job, canceledAt);
+  await writeJob(canceled);
+  return publicJob(canceled);
 }
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -213,7 +312,8 @@ function buildStagePrompt({ stageName, systemPrompt, userMessage, outputMode = '
   return `You are executing the "${stageName}" stage of a multi-agent reasoning pipeline.\nFollow the stage instructions exactly.\n\n<SYSTEM_PROMPT>\n${systemPrompt}\n</SYSTEM_PROMPT>\n\n<OUTPUT_INSTRUCTION>\n${outputInstruction}\n</OUTPUT_INSTRUCTION>\n\n<USER_MESSAGE>\n${userMessage}\n</USER_MESSAGE>`;
 }
 
-async function runCodexStage({ stageName, systemPrompt, userMessage, outputMode, model, reasoningEffort }) {
+async function runCodexStage({ stageName, systemPrompt, userMessage, outputMode, model, reasoningEffort, controller }) {
+  throwIfCanceled(controller);
   const prompt = buildStagePrompt({ stageName, systemPrompt, userMessage, outputMode });
   const tempDir = await mkdtemp(path.join(tmpdir(), 'multi-gpt-'));
   const outputPath = path.join(tempDir, 'last-message.txt');
@@ -231,7 +331,8 @@ async function runCodexStage({ stageName, systemPrompt, userMessage, outputMode,
   if (model) args.splice(5, 0, '--model', model);
 
   try {
-    const { stdout, stderr, code, signal } = await spawnWithInput(CODEX_COMMAND, args, prompt, CODEX_TIMEOUT_MS);
+    const { stdout, stderr, code, signal } = await spawnWithInput(CODEX_COMMAND, args, prompt, CODEX_TIMEOUT_MS, controller);
+    throwIfCanceled(controller);
     let text = '';
     if (existsSync(outputPath)) text = await readFile(outputPath, 'utf8');
     if (!text.trim()) text = extractTextFromJsonl(stdout) || stdout.trim();
@@ -244,10 +345,17 @@ async function runCodexStage({ stageName, systemPrompt, userMessage, outputMode,
   }
 }
 
-function spawnWithInput(command, args, input, timeoutMs) {
+function spawnWithInput(command, args, input, timeoutMs, controller) {
   return new Promise((resolve) => {
+    try {
+      throwIfCanceled(controller);
+    } catch (error) {
+      resolve({ stdout: '', stderr: String(error?.message || error), code: -1, signal: null });
+      return;
+    }
     const child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, shell: process.platform === 'win32' });
     ACTIVE_CHILDREN.add(child);
+    controller?.children?.add(child);
     let stdout = '';
     let stderr = '';
     let settled = false;
@@ -259,6 +367,7 @@ function spawnWithInput(command, args, input, timeoutMs) {
     child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
     child.on('error', (error) => {
       ACTIVE_CHILDREN.delete(child);
+      controller?.children?.delete(child);
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -266,6 +375,7 @@ function spawnWithInput(command, args, input, timeoutMs) {
     });
     child.on('close', (code, signal) => {
       ACTIVE_CHILDREN.delete(child);
+      controller?.children?.delete(child);
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -277,9 +387,53 @@ function spawnWithInput(command, args, input, timeoutMs) {
 }
 
 function terminateChildTree(child) {
+  terminateChildTreeAsync(child).catch(() => {});
+}
+
+function terminateChildTreeAsync(child) {
+  return new Promise((resolve) => {
+    if (!child?.pid) {
+      resolve({ ok: true });
+      return;
+    }
+
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve({ ok: true });
+      return;
+    }
+
+    if (process.platform === 'win32') {
+      const killer = spawn('taskkill.exe', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+      killer.on('error', (error) => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          resolve({ ok: true });
+        } else {
+          resolve({ ok: false, error: String(error?.message || error) });
+        }
+      });
+      killer.on('close', (code, signal) => {
+        if (code === 0 || child.exitCode !== null || child.signalCode !== null) {
+          resolve({ ok: true });
+        } else {
+          resolve({ ok: false, error: `taskkill exited with ${code}${signal ? ` (${signal})` : ''} for pid ${child.pid}` });
+        }
+      });
+      return;
+    }
+
+    try {
+      child.kill('SIGTERM');
+      resolve({ ok: true });
+    } catch (error) {
+      resolve({ ok: false, error: String(error?.message || error) });
+    }
+  });
+}
+
+function terminateChildTreeSync(child) {
   if (!child?.pid) return;
   if (process.platform === 'win32') {
-    spawn('taskkill.exe', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+    spawnSync('taskkill.exe', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
     return;
   }
   child.kill('SIGTERM');
@@ -287,12 +441,7 @@ function terminateChildTree(child) {
 
 function terminateActiveChildrenSync() {
   for (const child of ACTIVE_CHILDREN) {
-    if (!child?.pid) continue;
-    if (process.platform === 'win32') {
-      spawnSync('taskkill.exe', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-    } else {
-      child.kill('SIGTERM');
-    }
+    terminateChildTreeSync(child);
   }
 }
 function summarizeJsonl(stdout) {
@@ -347,16 +496,19 @@ function parseJsonObject(text) {
   return null;
 }
 
-async function mapLimit(items, limit, worker) {
+async function mapLimit(items, limit, worker, controller) {
   const results = new Array(items.length);
   let next = 0;
   const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
     while (next < items.length) {
+      if (controller?.canceled) break;
       const index = next++;
+      throwIfCanceled(controller);
       results[index] = await worker(items[index], index);
     }
   });
   await Promise.all(runners);
+  throwIfCanceled(controller);
   return results;
 }
 
@@ -388,7 +540,7 @@ function baseUserMessage(prompt, fileContext) {
   return `# Original User Request\n${prompt}\n\n${fileContext || ''}`.trim();
 }
 
-async function runPlanner(prompt, fileContext, options, trace) {
+async function runPlanner(prompt, fileContext, options, trace, controller) {
   const result = await runCodexStage({
     stageName: 'Planner',
     systemPrompt: plannerSystemPrompt(),
@@ -396,6 +548,7 @@ async function runPlanner(prompt, fileContext, options, trace) {
     outputMode: 'json',
     model: options.model,
     reasoningEffort: options.reasoningEffort,
+    controller,
   });
   if (!result.success) return { success: false, error: result.error, raw: result.text, stderr: result.stderr };
   const parsed = parseJsonObject(result.text);
@@ -412,7 +565,7 @@ async function runPlanner(prompt, fileContext, options, trace) {
   return { success: true, problemAnalysis: parsed.problem_analysis, approaches };
 }
 
-async function runSolvers(prompt, fileContext, problemAnalysis, approaches, options, trace) {
+async function runSolvers(prompt, fileContext, problemAnalysis, approaches, options, trace, controller) {
   const results = await mapLimit(approaches, SOLVER_CONCURRENCY, async (approach, index) => {
     const userMessage = `# Original User Request\n${prompt}\n\n${fileContext || ''}\n\n# Problem Analysis\n${JSON.stringify(problemAnalysis, null, 2)}\n\n# Assigned Approach\nName: ${approach.name}\nDescription: ${approach.description}\nMethodology: ${approach.methodology}`;
     const result = await runCodexStage({
@@ -422,17 +575,18 @@ async function runSolvers(prompt, fileContext, problemAnalysis, approaches, opti
       outputMode: 'text',
       model: options.model,
       reasoningEffort: options.reasoningEffort,
+      controller,
     });
     if (!result.success || !result.text.trim()) return { success: false, id: index, approachName: approach.name, error: result.error || 'empty solver output' };
     return { success: true, id: index, approachName: approach.name, content: result.text.trim() };
-  });
+  }, controller);
   const solutions = results.filter((r) => r?.success).map((r, id) => ({ ...r, id }));
   trace.push({ stage: 'Solver', status: solutions.length ? 'ok' : 'failed', succeeded: solutions.length, attempted: approaches.length, failures: results.filter((r) => !r?.success).map((r) => ({ id: r?.id, error: r?.error })) });
   if (!solutions.length) return { success: false, error: 'All solvers failed', failures: results };
   return { success: true, solutions };
 }
 
-async function runRefiners(solutions, prompt, fileContext, problemAnalysis, options, trace, label = 'Refiner') {
+async function runRefiners(solutions, prompt, fileContext, problemAnalysis, options, trace, label = 'Refiner', controller) {
   const results = await mapLimit(solutions, REFINER_CONCURRENCY, async (solution, index) => {
     const userMessage = `# Original User Request\n${prompt}\n\n${fileContext || ''}\n\n# Problem Analysis\n${JSON.stringify(problemAnalysis, null, 2)}\n\n# Candidate Solution (${solution.approachName || `Solution ${solution.id + 1}`})\n${solution.content}`;
     const result = await runCodexStage({
@@ -442,12 +596,13 @@ async function runRefiners(solutions, prompt, fileContext, problemAnalysis, opti
       outputMode: 'text',
       model: options.model,
       reasoningEffort: options.reasoningEffort,
+      controller,
     });
     if (!result.success || !result.text.trim()) {
       return { success: true, fallback: true, id: solution.id, approachName: solution.approachName, content: solution.content, error: result.error || 'empty refiner output' };
     }
     return { success: true, fallback: false, id: solution.id, approachName: solution.approachName, content: result.text.trim() };
-  });
+  }, controller);
   const refined = results.map((r, id) => ({ id, approachName: r.approachName, content: r.content }));
   trace.push({ stage: label, status: 'ok', count: refined.length, fallbacks: results.filter((r) => r.fallback).length });
   return { success: true, solutions: refined };
@@ -485,7 +640,8 @@ function stableScore(solution, seed) {
   return hash >>> 0;
 }
 
-async function runMergers(solutions, prompt, problemAnalysis, outstandingIds, options, trace, label = 'Merger') {
+async function runMergers(solutions, prompt, problemAnalysis, outstandingIds, options, trace, label = 'Merger', controller) {
+  throwIfCanceled(controller);
   if (solutions.length === 1) return { success: true, solutions: [{ id: 0, content: solutions[0].content, sourceIds: [solutions[0].id] }] };
   const count = Math.min(8, solutions.length);
   const effectiveOutstanding = outstandingIds?.length ? outstandingIds : solutions.map((s) => s.id);
@@ -499,17 +655,18 @@ async function runMergers(solutions, prompt, problemAnalysis, outstandingIds, op
       outputMode: 'text',
       model: options.model,
       reasoningEffort: options.reasoningEffort,
+      controller,
     });
     if (!result.success || !result.text.trim()) return { success: true, id: index, content: group[0].content, sourceIds: [group[0].id], fallback: true, error: result.error || 'empty merger output' };
     return { success: true, id: index, content: result.text.trim(), sourceIds: group.map((s) => s.id), fallback: false };
-  });
+  }, controller);
   const merged = results.filter((r) => r?.success).map((r, id) => ({ id, content: r.content, sourceIds: r.sourceIds }));
   trace.push({ stage: label, status: merged.length ? 'ok' : 'failed', count: merged.length, fallbacks: results.filter((r) => r?.fallback).length });
   if (!merged.length) return { success: false, error: 'All mergers failed' };
   return { success: true, solutions: merged };
 }
 
-async function runJudge(solutions, prompt, problemAnalysis, options, trace, iteration) {
+async function runJudge(solutions, prompt, problemAnalysis, options, trace, iteration, controller) {
   const userMessage = `# Original User Request\n${prompt}\n\n# Problem Analysis\n${JSON.stringify(problemAnalysis, null, 2)}\n\n# Candidate Solutions\n${solutions.map((s, i) => `## Solution ${i + 1} (ID: ${i + 1})\n${s.content}`).join('\n\n---\n\n')}`;
   const result = await runCodexStage({
     stageName: `Judge ${iteration}`,
@@ -518,6 +675,7 @@ async function runJudge(solutions, prompt, problemAnalysis, options, trace, iter
     outputMode: 'json',
     model: options.model,
     reasoningEffort: options.reasoningEffort,
+    controller,
   });
   if (!result.success) return { success: false, error: result.error, raw: result.text };
   const parsed = parseJsonObject(result.text);
@@ -544,26 +702,27 @@ function remapSolutions(solutions) {
   return solutions.map((solution, id) => ({ ...solution, id }));
 }
 
-async function runLoop(initialSolutions, prompt, fileContext, problemAnalysis, options, trace) {
+async function runLoop(initialSolutions, prompt, fileContext, problemAnalysis, options, trace, controller) {
   let current = remapSolutions(initialSolutions);
   let outstandingIds = current.map((s) => s.id);
   let iterations = 0;
 
   if (current.length === 1) {
-    const refined = await runRefiners(current, prompt, fileContext, problemAnalysis, options, trace, 'Loop Final Refiner');
+    const refined = await runRefiners(current, prompt, fileContext, problemAnalysis, options, trace, 'Loop Final Refiner', controller);
     return { success: true, bestSolution: refined.solutions[0] || current[0], allSolutions: refined.solutions || current, iterations };
   }
 
   while (iterations < options.maxIterations) {
+    throwIfCanceled(controller);
     iterations += 1;
-    const merged = await runMergers(current, prompt, problemAnalysis, outstandingIds, options, trace, `Loop ${iterations} Merger`);
+    const merged = await runMergers(current, prompt, problemAnalysis, outstandingIds, options, trace, `Loop ${iterations} Merger`, controller);
     if (!merged.success) break;
-    const refined = await runRefiners(remapSolutions(merged.solutions), prompt, fileContext, problemAnalysis, options, trace, `Loop ${iterations} Refiner`);
+    const refined = await runRefiners(remapSolutions(merged.solutions), prompt, fileContext, problemAnalysis, options, trace, `Loop ${iterations} Refiner`, controller);
     let candidates = remapSolutions(refined.solutions);
     if (!candidates.length) return { success: false, error: 'No solutions remaining after refiner', iterations };
     if (candidates.length === 1) return { success: true, bestSolution: candidates[0], allSolutions: candidates, iterations };
 
-    const judged = await runJudge(candidates, prompt, problemAnalysis, options, trace, iterations);
+    const judged = await runJudge(candidates, prompt, problemAnalysis, options, trace, iterations, controller);
     if (!judged.success) {
       trace.push({ stage: 'Judge', status: 'fallback', iteration: iterations, error: judged.error });
       current = candidates;
@@ -592,14 +751,14 @@ async function runLoop(initialSolutions, prompt, fileContext, problemAnalysis, o
     ? current.filter((s) => outstandingIds.includes(s.id))
     : current;
   if (!finalSolutions.length) finalSolutions = current;
-  const finalMerge = await runMergers(finalSolutions, prompt, problemAnalysis, [], options, trace, 'Final Merger');
+  const finalMerge = await runMergers(finalSolutions, prompt, problemAnalysis, [], options, trace, 'Final Merger', controller);
   let finalSolution = finalMerge.success && finalMerge.solutions.length ? finalMerge.solutions[0] : finalSolutions[0];
-  const finalRefine = await runRefiners([finalSolution], prompt, fileContext, problemAnalysis, options, trace, 'Final Refiner');
+  const finalRefine = await runRefiners([finalSolution], prompt, fileContext, problemAnalysis, options, trace, 'Final Refiner', controller);
   if (finalRefine.success && finalRefine.solutions.length) finalSolution = finalRefine.solutions[0];
   return { success: true, bestSolution: finalSolution, allSolutions: current, iterations };
 }
 
-async function runOrganizer(prompt, fileContext, problemAnalysis, bestSolution, options, trace) {
+async function runOrganizer(prompt, fileContext, problemAnalysis, bestSolution, options, trace, controller) {
   const userMessage = `# Original User Request\n${prompt}\n\n${fileContext || ''}\n\n# Problem Analysis\n${JSON.stringify(problemAnalysis, null, 2)}\n\n# Best Solution From MAR\n${bestSolution.content}`;
   const result = await runCodexStage({
     stageName: 'Organizer',
@@ -608,6 +767,7 @@ async function runOrganizer(prompt, fileContext, problemAnalysis, bestSolution, 
     outputMode: 'text',
     model: options.model,
     reasoningEffort: options.reasoningEffort,
+    controller,
   });
   if (!result.success || !result.text.trim()) {
     trace.push({ stage: 'Organizer', status: 'fallback', error: result.error || 'empty organizer output' });
@@ -617,22 +777,23 @@ async function runOrganizer(prompt, fileContext, problemAnalysis, bestSolution, 
   return { success: true, finalAnswer: result.text.trim(), fallback: false };
 }
 
-async function codexMar(args) {
+async function codexMar(args, controller) {
   const options = normalizeOptions(args);
   const trace = [];
   const { fileContext, fileSummaries } = await readContextFiles(options.files);
 
-  const planner = await runPlanner(options.prompt, fileContext, options, trace);
+  throwIfCanceled(controller);
+  const planner = await runPlanner(options.prompt, fileContext, options, trace, controller);
   if (!planner.success) return { ok: false, stage: 'Planner', error: planner.error, raw: planner.raw, metadata: metadata(options, fileSummaries, trace) };
 
-  const solved = await runSolvers(options.prompt, fileContext, planner.problemAnalysis, planner.approaches, options, trace);
+  const solved = await runSolvers(options.prompt, fileContext, planner.problemAnalysis, planner.approaches, options, trace, controller);
   if (!solved.success) return { ok: false, stage: 'Solver', error: solved.error, failures: solved.failures, metadata: metadata(options, fileSummaries, trace) };
 
-  const refined = await runRefiners(solved.solutions, options.prompt, fileContext, planner.problemAnalysis, options, trace, 'Initial Refiner');
-  const loop = await runLoop(refined.solutions, options.prompt, fileContext, planner.problemAnalysis, options, trace);
+  const refined = await runRefiners(solved.solutions, options.prompt, fileContext, planner.problemAnalysis, options, trace, 'Initial Refiner', controller);
+  const loop = await runLoop(refined.solutions, options.prompt, fileContext, planner.problemAnalysis, options, trace, controller);
   if (!loop.success) return { ok: false, stage: 'Loop', error: loop.error, metadata: metadata(options, fileSummaries, trace) };
 
-  const organized = await runOrganizer(options.prompt, fileContext, planner.problemAnalysis, loop.bestSolution, options, trace);
+  const organized = await runOrganizer(options.prompt, fileContext, planner.problemAnalysis, loop.bestSolution, options, trace, controller);
   return {
     ok: true,
     final_answer: organized.finalAnswer,
@@ -661,6 +822,7 @@ function metadata(options, fileSummaries, trace) {
 async function handleToolCall(name, args) {
   if (name === 'multi_gpt_start') return textResult(await startMultiGptJob(args || {}));
   if (name === 'multi_gpt_status') return textResult(await getMultiGptJobStatus(args || {}));
+  if (name === 'multi_gpt_cancel') return textResult(await cancelMultiGptJob(args || {}));
   throw new Error(`Unknown tool: ${name}`);
 }
 

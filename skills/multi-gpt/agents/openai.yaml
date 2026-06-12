@@ -1,4 +1,4 @@
 interface:
   display_name: "Multi GPT"
-  short_description: "Run PC-local parallel reasoning with multiple Codex stages."
-  default_prompt: "Use Multi GPT to compare several independent approaches and synthesize the best answer."
+  short_description: "Run or cancel local parallel reasoning with multiple Codex stages."
+  default_prompt: "Use Multi GPT to compare several independent approaches, synthesize the best answer, or cancel a mistakenly started Multi GPT job."

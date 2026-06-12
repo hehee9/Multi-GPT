@@ -1,6 +1,6 @@
 # Multi GPT Codex
 
-Multi GPT is a Codex Skill plus MCP server for PC-local parallel reasoning. It starts an async background job that runs multiple read-only `codex exec` stages, compares independent approaches, refines them, judges sufficiency, and returns a concise final answer.
+Multi GPT is a Codex Skill plus MCP server for local parallel reasoning. It starts an async background job that runs multiple read-only `codex exec` stages, compares independent approaches, refines them, judges sufficiency, and returns a concise final answer.
 
 Inspired by GPT Pro, Gemini DeepThink, and Grok MultiAgents; implemented as a local Codex parallel-reasoning MCP + Skill.
 
@@ -16,9 +16,10 @@ Inspired by GPT Pro, Gemini DeepThink, and Grok MultiAgents; implemented as a lo
 
 - Starts long-running reasoning jobs through `multi_gpt_start`.
 - Retrieves job state and final output through `multi_gpt_status`.
+- Cancels mistakenly started running jobs through `multi_gpt_cancel`.
 - Uses a Planner -> parallel Solvers -> parallel Refiners -> Loop(Merger -> Refiner -> Judge) -> Organizer pipeline.
 - Keeps each Codex stage read-only with no approval prompts.
-- Lets Codex CLI use its configured default model unless you pass a `model` argument.
+- Lets Codex CLI use its configured or recommended default model unless you pass a `model` argument.
 
 Use it for complex design comparisons, deep code or architecture review, and long-form problem solving that benefits from several independent approaches. Do not use it for ordinary short answers.
 
@@ -89,12 +90,15 @@ Ask Codex for Multi GPT or a parallel-reasoning review of a complex task. Codex 
 1. `multi_gpt_start` with:
    - `prompt` (required)
    - `files` (optional absolute file paths)
-   - `model` (optional; omitted means Codex CLI default)
+   - `model` (optional; omitted means Codex CLI default or recommended model)
    - `reasoning_effort` (`none`, `low`, `medium`, `high`, or `xhigh`)
    - `max_iterations` (optional; default `5`, clamped to `1..10`)
 2. `multi_gpt_status` with the returned `job_id`.
+3. `multi_gpt_cancel` with the returned `job_id` if the job was started by mistake.
 
 Runs usually take 5-20 minutes and commonly finish around 10-15 minutes, so poll only occasionally unless tighter monitoring is necessary.
+
+`multi_gpt_status` returns `status: completed`, `failed`, `running`, or `canceled`. Treat `canceled` as a terminal state. Cancelation targets jobs owned by the current MCP server process; after a server restart, stale job files can still be inspected but their former child processes cannot be targeted reliably.
 
 ## License
 
