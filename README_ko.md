@@ -102,6 +102,10 @@ Codex에게 Multi GPT나 병렬 추론 리뷰를 요청하면, 복잡한 작업�
 
 `multi_gpt_status`는 `completed`, `failed`, `running`, `canceled` 상태를 반환합니다. `canceled`는 더 이상 폴링하지 않아도 되는 최종 상태입니다. 취소는 현재 MCP 서버 프로세스가 소유한 실행 중 작업을 대상으로 하며, 서버 재시작 뒤 남아 있는 작업 파일은 상태 확인만 안정적으로 가능합니다.
 
+## 연락처
+
+gyugyum@gmail.com
+
 ## 라이선스
 
 MIT 라이선스로 배포됩니다. 자세한 내용은 [LICENSE](LICENSE)를 참고하세요.

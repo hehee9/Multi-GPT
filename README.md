@@ -100,6 +100,10 @@ Runs usually take 5-20 minutes and commonly finish around 10-15 minutes, so poll
 
 `multi_gpt_status` returns `status: completed`, `failed`, `running`, or `canceled`. Treat `canceled` as a terminal state. Cancelation targets jobs owned by the current MCP server process; after a server restart, stale job files can still be inspected but their former child processes cannot be targeted reliably.
 
+## Contact
+
+gyugyum@gmail.com
+
 ## License
 
 Released under the MIT License. See [LICENSE](LICENSE) for details.
